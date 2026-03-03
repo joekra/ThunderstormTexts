@@ -1,0 +1,91 @@
+name: Build and Push Vite React App to GAR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Allow manual triggering from the Actions tab
+
+env:
+  GCP_PROJECT_ID: "hailtrace-host-project"
+  GCP_GAR_LOCATION: "us-central1"
+  GCP_GAR_REPOSITORY: "ht-main"
+  GCP_WIF_URL: "projects/634441523231/locations/global/workloadIdentityPools/github-cicd/providers/gh-artbuilder"
+  IMAGE_NAME: thunderstorm-alerts # Name of your image in GAR
+  GITOPS_REPO_URL: "hailtrace/gitops-infrastructure"
+  GITOPS_REPO_PATH: "argocd/repositories/thunderstorm-alerts"
+  CUE_FILE: "argocd/repositories/thunderstorm-alerts/thunderstorm-alerts.cue"
+
+permissions:
+  contents: read # To checkout the repository
+  id-token: write # To authenticate to Google Cloud via Workload Identity Federation
+  packages: read
+
+jobs:
+  build-and-push:
+    name: Build and Push to GAR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: hailtrace-host-project
+          workload_identity_provider: ${{ env.GCP_WIF_URL }} # Use env var directly
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Configure Docker to use the gcloud command-line tool as a credential
+      # helper for authentication with Artifact Registry.
+      - name: Configure Docker for GAR
+        run: gcloud auth configure-docker ${{ env.GCP_GAR_LOCATION }}-docker.pkg.dev --quiet
+
+      - name: Generate Docker Image Tags
+        id: docker_meta
+        uses: docker/metadata-action@v5
+        with:
+          # Define the base image path using GAR format and the determined repository
+          images: ${{ env.GCP_GAR_LOCATION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GCP_GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag with the Git SHA (short format)
+            type=sha,prefix=,suffix=,format=short
+            # Tag with 'latest' only if the push is to the master branch
+            # type=raw,value=latest,enable=${{ github.ref_name == 'master' }}
+            # Tag with branch name if not master (e.g., 'development')
+            type=sha,prefix=,suffix=,format=short,enable=${{ github.ref_name != 'master' }}
+
+      - name: Build and Push Docker Image to GAR
+        uses: docker/build-push-action@v5
+        with:
+          context: . # Use the current directory as context
+          file: ./Dockerfile # Path to your Dockerfile
+          push: true # Push the image after building
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          # Enable Docker layer caching using GitHub Actions cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NPM_TOKEN_GITHUB=${{ secrets.GITHUB_TOKEN }}
+            ENVIRONMENT=${{ steps.gar_repo.outputs.node_env }}
+      - name: Print Image Details
+        run: |
+          echo "Target Repository: ${{ env.GCP_GAR_REPOSITORY }}"
+          echo "Successfully pushed image with tags:"
+          echo "${{ steps.docker_meta.outputs.tags }}"
+          echo "Labels applied:"
+          echo "${{ steps.docker_meta.outputs.labels }}"
+
+      - name: Update GitOps Repository with New Image Tag
+        uses: hailtrace/actions/update-gitops-tag@v1
+        with:
+          app_id: ${{ vars.GHA_GITOPS_APP_ID }}
+          private_key: ${{ secrets.GHA_GITOPS }}
+          cue_file: ${{ env.CUE_FILE }}
+          image_tag: ${{ fromJSON(steps.docker_meta.outputs.json).labels['org.opencontainers.image.version'] }}
+          environment: "prd"
